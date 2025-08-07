@@ -47,6 +47,7 @@ type SubmitJobOptions struct {
 	logColor                 string
 	useIngress               bool
 	address                  string
+	clusterTimeout           float64
 	image                    string
 	fileName                 string
 	workingDir               string
@@ -153,6 +154,7 @@ func NewJobSubmitCommand(cmdFactory cmdutil.Factory, streams genericclioptions.I
 	cmd.Flags().StringVarP(&options.fileName, "filename", "f", "", "Path and name of the Ray Job YAML file")
 	cmd.Flags().StringVar(&options.address, "address", dashboardAddr, "Address of the Ray cluster to connect to")
 	cmd.Flags().BoolVar(&options.useIngress, "use-ingress", false, "Skip port-forwarding and use the provided --address (e.g. an Ingress endpoint)")
+	cmd.Flags().Float64Var(&options.clusterTimeout, "cluster-timeout", clusterTimeout, "Timeout in seconds to wait for Ray cluster to become ready before failing")
 	cmd.Flags().StringVar(&options.submissionID, "submission-id", "", "ID to specify for the Ray job. If not provided, one will be generated")
 	cmd.Flags().StringVar(&options.runtimeEnv, "runtime-env", "", "Path and name to the runtime env YAML file.")
 	cmd.Flags().StringVar(&options.workingDir, "working-dir", "", "Directory containing files that your job will run in")
@@ -233,6 +235,10 @@ func (options *SubmitJobOptions) Validate(cmd *cobra.Command) error {
 
 	if options.ttlSecondsAfterFinished < 0 {
 		return fmt.Errorf("--ttl-seconds-after-finished must be greater than or equal to 0")
+	}
+
+	if options.clusterTimeout <= 0 {
+		return fmt.Errorf("--cluster-timeout must be greater than 0")
 	}
 
 	// Take care of case where there is a filename input
@@ -409,7 +415,7 @@ func (options *SubmitJobOptions) Run(ctx context.Context, factory cmdutil.Factor
 	currTime := clusterWaitStartTime
 	fmt.Printf("Waiting for RayCluster\n")
 	fmt.Printf("Checking Cluster Status for cluster %s...\n", options.cluster)
-	for !clusterReady && currTime.Sub(clusterWaitStartTime).Seconds() <= clusterTimeout {
+	for !clusterReady && currTime.Sub(clusterWaitStartTime).Seconds() <= options.clusterTimeout {
 		time.Sleep(2 * time.Second)
 		currCluster, err := k8sClients.RayClient().RayV1().RayClusters(options.namespace).Get(ctx, options.cluster, v1.GetOptions{})
 		if err != nil {
