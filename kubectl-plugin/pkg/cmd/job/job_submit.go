@@ -16,10 +16,12 @@ import (
 
 	"github.com/google/shlex"
 	"github.com/spf13/cobra"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/kubectl/pkg/cmd/portforward"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/util/templates"
@@ -32,10 +34,15 @@ import (
 	rayscheme "github.com/ray-project/kuberay/ray-operator/pkg/client/clientset/versioned/scheme"
 )
 
+type ConnectMode string
+
 const (
-	dashboardAddr      = "http://localhost:8265"
-	clusterTimeout     = 120.0
-	portforwardtimeout = 60.0
+	dashboardAddr                  = "http://localhost:8265"
+	clusterTimeout                 = 120.0
+	portforwardtimeout             = 60.0
+	ConnectPortForward ConnectMode = "port-forward"
+	ConnectIngress     ConnectMode = "ingress"
+	ConnectExternal    ConnectMode = "external"
 )
 
 type SubmitJobOptions struct {
@@ -45,8 +52,18 @@ type SubmitJobOptions struct {
 	workerNodeSelectors      map[string]string
 	headNodeSelectors        map[string]string
 	logColor                 string
-	useIngress               bool
 	address                  string
+	connectMode              ConnectMode
+	ingressClass             string
+	ingressIssuer            string
+	ingressMiddlewares       []string
+	ingressWaitTimeout       float64
+	ingressBaseDomain        string
+	ingressTLSSecret         string
+	ingressName              string
+	ingressHost              string
+	ingressAnnotations       map[string]string
+	ingressLabels            map[string]string
 	clusterTimeout           float64
 	image                    string
 	fileName                 string
@@ -152,8 +169,20 @@ func NewJobSubmitCommand(cmdFactory cmdutil.Factory, streams genericclioptions.I
 		},
 	}
 	cmd.Flags().StringVarP(&options.fileName, "filename", "f", "", "Path and name of the Ray Job YAML file")
-	cmd.Flags().StringVar(&options.address, "address", dashboardAddr, "Address of the Ray cluster to connect to")
-	cmd.Flags().BoolVar(&options.useIngress, "use-ingress", false, "Skip port-forwarding and use the provided --address (e.g. an Ingress endpoint)")
+	cmd.Flags().StringVar(&options.address, "address", dashboardAddr,
+		"Target Ray endpoint. Used with --connect=external; ignored otherwise.")
+	cmd.Flags().StringVar((*string)(&options.connectMode), "connect", string(ConnectPortForward),
+		"How to reach the Ray dashboard: port-forward | ingress | external")
+	cmd.Flags().StringVar(&options.ingressClass, "ingress-class", "", "IngressClassName (optional)")
+	cmd.Flags().StringVar(&options.ingressIssuer, "ingress-issuer", "", "cert-manager ClusterIssuer (optional)")
+	cmd.Flags().StringSliceVar(&options.ingressMiddlewares, "ingress-middlewares", nil, "Controller-specific middlewares (optional)")
+	cmd.Flags().Float64Var(&options.ingressWaitTimeout, "ingress-wait-timeout", 120, "Seconds to wait for Ingress address")
+	cmd.Flags().StringVar(&options.ingressBaseDomain, "ingress-base-domain", "", "Base domain to generate host (if --ingress-host empty)")
+	cmd.Flags().StringVar(&options.ingressHost, "ingress-host", "", "Explicit host for the ephemeral Ingress")
+	cmd.Flags().StringVar(&options.ingressTLSSecret, "ingress-tls-secret", "", "TLS secret for the Ingress (optional)")
+	cmd.Flags().StringVar(&options.ingressName, "ingress-name", "", "Ingress resource name (default <rayjob>-ing)")
+	cmd.Flags().StringToStringVar(&options.ingressAnnotations, "ingress-annotation", nil, "Extra Ingress annotations (repeatable)")
+	cmd.Flags().StringToStringVar(&options.ingressLabels, "ingress-label", nil, "Extra Ingress labels (repeatable)")
 	cmd.Flags().Float64Var(&options.clusterTimeout, "cluster-timeout", clusterTimeout, "Timeout in seconds to wait for Ray cluster to become ready before failing")
 	cmd.Flags().StringVar(&options.submissionID, "submission-id", "", "ID to specify for the Ray job. If not provided, one will be generated")
 	cmd.Flags().StringVar(&options.runtimeEnv, "runtime-env", "", "Path and name to the runtime env YAML file.")
@@ -317,15 +346,153 @@ func (options *SubmitJobOptions) Validate(cmd *cobra.Command) error {
 		}
 	}
 
-	if options.useIngress && options.address == "" {
-		return fmt.Errorf("--use-ingress was set, but --address is missing or empty")
-	}
+	switch options.connectMode {
+	case ConnectPortForward:
+		if options.address != "" && options.address != dashboardAddr && cmd.Flags().Changed("address") {
+			return fmt.Errorf("--address is ignored for --connect=port-forward")
+		}
 
-	if !options.useIngress && options.address != "" && options.address != dashboardAddr {
-		return fmt.Errorf("--address=%q is not valid unless --use-ingress is set", options.address)
+	case ConnectIngress:
+		if options.ingressHost == "" && options.ingressBaseDomain == "" {
+			return fmt.Errorf("--connect=ingress requires either --ingress-host or --ingress-base-domain")
+		}
+		if options.ingressWaitTimeout <= 0 {
+			return fmt.Errorf("--ingress-wait-timeout must be > 0")
+		}
+
+	case ConnectExternal:
+		if options.address == "" || options.address == dashboardAddr {
+			return fmt.Errorf("--connect=external requires a valid --address (non-localhost)")
+		}
+
+	default:
+		return fmt.Errorf("invalid --connect mode: %q (use: port-forward | ingress | external)", options.connectMode)
 	}
 
 	return nil
+}
+
+func ownerRefTo(job *rayv1.RayJob) v1.OwnerReference {
+	return v1.OwnerReference{
+		APIVersion: "ray.io/v1",
+		Kind:       "RayJob",
+		Name:       job.GetName(),
+		UID:        job.GetUID(),
+	}
+}
+
+func ensureEphemeralIngress(
+	ctx context.Context,
+	kube kubernetes.Interface,
+	o *SubmitJobOptions,
+	svcName string,
+) error {
+	pathType := networkingv1.PathTypePrefix
+
+	anns := map[string]string{}
+	for kA, vA := range o.ingressAnnotations {
+		anns[kA] = vA
+	}
+	if o.ingressIssuer != "" {
+		anns["cert-manager.io/cluster-issuer"] = o.ingressIssuer
+	}
+	if len(o.ingressMiddlewares) > 0 {
+		anns["traefik.ingress.kubernetes.io/router.middlewares"] = strings.Join(o.ingressMiddlewares, ",")
+	}
+
+	labels := map[string]string{
+		"app.kubernetes.io/part-of": "ray",
+		"ray.cluster":               o.cluster,
+		"ray.job":                   o.RayJob.GetName(),
+		"ephemeral":                 "true",
+	}
+	for kL, vL := range o.ingressLabels {
+		labels[kL] = vL
+	}
+
+	ing := &networkingv1.Ingress{
+		ObjectMeta: v1.ObjectMeta{
+			Name:            o.ingressName,
+			Namespace:       o.namespace,
+			Annotations:     anns,
+			Labels:          labels,
+			OwnerReferences: []v1.OwnerReference{ownerRefTo(o.RayJob)},
+		},
+		Spec: networkingv1.IngressSpec{
+			Rules: []networkingv1.IngressRule{{
+				Host: o.ingressHost,
+				IngressRuleValue: networkingv1.IngressRuleValue{
+					HTTP: &networkingv1.HTTPIngressRuleValue{
+						Paths: []networkingv1.HTTPIngressPath{{
+							Path:     "/",
+							PathType: &pathType,
+							Backend: networkingv1.IngressBackend{
+								Service: &networkingv1.IngressServiceBackend{
+									Name: svcName,
+									Port: networkingv1.ServiceBackendPort{Number: 8265},
+								},
+							},
+						}},
+					},
+				},
+			}},
+		},
+	}
+
+	if o.ingressClass != "" {
+		ing.Spec.IngressClassName = &o.ingressClass
+	}
+	if o.ingressTLSSecret != "" && o.ingressHost != "" {
+		ing.Spec.TLS = []networkingv1.IngressTLS{{
+			Hosts:      []string{o.ingressHost},
+			SecretName: o.ingressTLSSecret,
+		}}
+	}
+
+	ingClient := kube.NetworkingV1().Ingresses(o.namespace)
+	if _, err := ingClient.Create(ctx, ing, v1.CreateOptions{}); err != nil {
+		if !strings.Contains(err.Error(), "already exists") {
+			return fmt.Errorf("ingress create failed: %w", err)
+		}
+		cur, err2 := ingClient.Get(ctx, o.ingressName, v1.GetOptions{})
+		if err2 != nil {
+			return fmt.Errorf("ingress get failed: %w", err2)
+		}
+		ing.ResourceVersion = cur.ResourceVersion
+		if _, err3 := ingClient.Update(ctx, ing, v1.UpdateOptions{}); err3 != nil {
+			return fmt.Errorf("ingress update failed: %w", err3)
+		}
+	}
+
+	fmt.Printf("Applied ephemeral Ingress %s for host %s\n", o.ingressName, o.ingressHost)
+	return nil
+}
+
+func waitForIngressAddress(
+	ctx context.Context,
+	kube kubernetes.Interface,
+	ns, name string,
+	timeout time.Duration,
+) (string, error) {
+	deadline := time.Now().Add(timeout)
+	ingClient := kube.NetworkingV1().Ingresses(ns)
+	for time.Now().Before(deadline) {
+		ing, err := ingClient.Get(ctx, name, v1.GetOptions{})
+		if err != nil {
+			return "", fmt.Errorf("ingress get failed: %w", err)
+		}
+		if len(ing.Status.LoadBalancer.Ingress) > 0 {
+			lb := ing.Status.LoadBalancer.Ingress[0]
+			if lb.Hostname != "" {
+				return lb.Hostname, nil
+			}
+			if lb.IP != "" {
+				return lb.IP, nil
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return "", fmt.Errorf("timed out waiting for Ingress address on %s", name)
 }
 
 func (options *SubmitJobOptions) Run(ctx context.Context, factory cmdutil.Factory) error {
@@ -439,7 +606,9 @@ func (options *SubmitJobOptions) Run(ctx context.Context, factory cmdutil.Factor
 		return fmt.Errorf("Timed out waiting for cluster")
 	}
 
-	if !options.useIngress {
+	switch options.connectMode {
+	case ConnectPortForward:
+		// TODO(JosefNagelschmidt): Extract into method
 		svcName, err := k8sClients.GetRayHeadSvcName(ctx, options.namespace, util.RayCluster, options.cluster)
 		if err != nil {
 			return fmt.Errorf("Failed to find service name: %w", err)
@@ -489,8 +658,50 @@ func (options *SubmitJobOptions) Run(ctx context.Context, factory cmdutil.Factor
 			return fmt.Errorf("Timed out waiting for port forwarding")
 		}
 		fmt.Printf("Portforwarding started on %s\n", options.address)
-	} else {
-		fmt.Printf("Using ingress at %s, skipping port forwarding\n", options.address)
+
+	case ConnectIngress:
+		// TODO(JosefNagelschmidt): Extract into method
+		kube := k8sClients.KubernetesClient()
+		svcName, err := k8sClients.GetRayHeadSvcName(ctx, options.namespace, util.RayCluster, options.cluster)
+		if err != nil {
+			return fmt.Errorf("failed to find head service name: %w", err)
+		}
+
+		if options.ingressName == "" {
+			options.ingressName = fmt.Sprintf("%s-ing", options.RayJob.GetName())
+		}
+		if options.ingressHost == "" {
+			rid, _ := generateSubmissionID()
+			short := strings.ToLower(rid[len("raysubmit_") : len("raysubmit_")+6])
+			if options.ingressBaseDomain == "" {
+				return fmt.Errorf("--ingress-base-domain required when --ingress-host is not provided")
+			}
+			options.ingressHost = fmt.Sprintf("%s-%s.%s", options.RayJob.GetName(), short, options.ingressBaseDomain)
+		}
+		if options.ingressTLSSecret == "" && options.ingressIssuer != "" {
+			options.ingressTLSSecret = fmt.Sprintf("%s-tls", options.RayJob.GetName())
+		}
+
+		if err := ensureEphemeralIngress(ctx, kube, options, svcName); err != nil {
+			return err
+		}
+		addr, err := waitForIngressAddress(ctx, kube, options.namespace, options.ingressName, time.Duration(options.ingressWaitTimeout)*time.Second)
+		if err != nil {
+			return err
+		}
+
+		scheme := "http"
+		if options.ingressTLSSecret != "" {
+			scheme = "https"
+		}
+		options.address = fmt.Sprintf("%s://%s", scheme, options.ingressHost)
+
+		fmt.Printf("RAY_INGRESS_URL=%s\n", options.address)
+		fmt.Printf("Ingress ready at %s (LB: %s)\n", options.address, addr)
+
+	case ConnectExternal:
+		// TODO(JosefNagelschmidt): Extract into method
+		fmt.Printf("Using external endpoint %s\n", options.address)
 	}
 
 	// If submission ID is not provided by the user, generate one.
